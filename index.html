@@ -42,7 +42,17 @@
   .btn.danger{background:var(--err);color:#fff}
   .btn.sec{background:#fff;color:var(--fg);border:1px solid var(--border)}
   .btn:disabled{opacity:.5;cursor:not-allowed}
-  .log{background:#1a1a1a;color:#d4d4d4;border-radius:6px;padding:12px;height:380px;overflow:auto;font-family:ui-monospace,monospace;font-size:11px;white-space:pre-wrap;line-height:1.5}
+  .log{background:#1a1a1a;color:#d4d4d4;border-radius:6px;padding:12px;height:200px;overflow:auto;font-family:ui-monospace,monospace;font-size:11px;white-space:pre-wrap;line-height:1.5}
+  .results{margin-top:12px;border:1px solid var(--border);border-radius:6px;max-height:300px;overflow:auto}
+  .results-head{padding:8px 12px;background:#fafafa;border-bottom:1px solid var(--border);font-size:12px;font-weight:600;display:flex;justify-content:space-between;align-items:center}
+  .result-item{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;border-bottom:1px solid var(--border);font-size:12px;cursor:pointer;text-decoration:none;color:var(--fg)}
+  .result-item:hover{background:#f0fdff}
+  .result-item:last-child{border-bottom:0}
+  .result-meta{flex:1;min-width:0;margin-right:8px}
+  .result-subj{font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .result-info{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .result-size{font-size:11px;color:var(--acc);font-weight:600;margin-top:2px}
+  .result-dl{color:var(--acc);font-size:11px;flex-shrink:0}
   .status-bar{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
   .status{display:inline-block;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600;background:#eef;color:var(--muted)}
   .status.running{background:#dbeafe;color:#1d4ed8}
@@ -100,12 +110,9 @@
       <div>
         <label class="req">Return Type</label>
         <select id="return_type">
-          <option value="">select return type</option>
-          <option value="fullsource">FullSource</option>
-          <option value="fullheader">FullHeader</option>
-          <option value="header">Header</option>
-          <option value="body" selected>Body</option>
-          <option value="bodyparameter">BodyParameter</option>
+          <option value="html" selected>Raw HTML (one line)</option>
+          <option value="text">Text only (links removed)</option>
+          <option value="html_no_text">HTML structure only (no text)</option>
         </select>
       </div>
     </div>
@@ -116,9 +123,6 @@
         <textarea id="creds" placeholder="me@gmail.com:app_password&#10;other@yahoo.com:xxxx"></textarea>
       </div>
       <div>
-        <label>Header Value</label>
-        <input id="header_value" placeholder="Insert Header value">
-
         <label>Max Emails Number</label>
         <input id="max_emails" type="number" value="0" min="0">
         <div class="hint">0 = unlimited</div>
@@ -147,7 +151,7 @@
     <div class="btn-row">
       <button class="btn primary" id="go">▶ Start extraction</button>
       <button class="btn danger" id="stop" disabled>■ Stop</button>
-      <button class="btn sec" id="dl" disabled>⬇ Download (.zip)</button>
+      <button class="btn sec" id="dl" disabled>⬇ Download all (.zip)</button>
     </div>
   </div>
 
@@ -157,6 +161,13 @@
       <small class="hint" id="jobid"></small>
     </div>
     <div class="log" id="log">Waiting…</div>
+    <div class="results" id="results-wrap" style="display:none">
+      <div class="results-head">
+        <span>Results (<span id="results-count">0</span>)</span>
+        <span class="hint">Click any item to download as .txt</span>
+      </div>
+      <div id="results-list"></div>
+    </div>
   </div>
 
 </div>
@@ -238,10 +249,9 @@ $('go').addEventListener('click', async ()=>{
     credentials,
     provider,
     folder: $('folder').value,
-    return_type: $('return_type').value || 'body',
+    return_type: $('return_type').value || 'html',
     symbol_separator: $('sym_sep').value,
     result_separator: $('result_sep').value || '_SEPARATOR_',
-    header_value: $('header_value').value,
     max_emails: $('max_emails').value || 0,
     order: $('order').value,
     filter_operator: $('filter_op').value,
@@ -249,6 +259,7 @@ $('go').addEventListener('click', async ()=>{
     batch_size: 10,
   };
   setActive(true); $('dl').disabled = true; $('log').textContent = '';
+  $('results-wrap').style.display='none'; $('results-list').innerHTML='';
   setStatus('starting');
   const r = await fetch('/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(params)});
   if(r.status===401){ window.location='/login'; return; }
@@ -266,6 +277,28 @@ $('stop').addEventListener('click', async ()=>{
   await fetch('/stop/'+jobId, {method:'POST'});
 });
 
+function fmtSize(n){
+  if(n<1024) return n+'B';
+  if(n<1024*1024) return (n/1024).toFixed(1)+'KB';
+  return (n/1024/1024).toFixed(1)+'MB';
+}
+
+function renderResults(files){
+  const wrap = $('results-wrap'), list = $('results-list');
+  if(!files || !files.length){ wrap.style.display='none'; return; }
+  wrap.style.display='block';
+  $('results-count').textContent = files.length;
+  list.innerHTML = files.map(f => `
+    <a class="result-item" href="/file/${jobId}/${encodeURIComponent(f.name)}" download>
+      <div class="result-meta">
+        <div class="result-subj">${(f.subject||'(no subject)').replace(/[<>]/g,'')}</div>
+        <div class="result-info">${(f.from||'').replace(/[<>]/g,'')} · ${f.email}</div>
+        <div class="result-size">📄 ${fmtSize(f.size)}</div>
+      </div>
+      <div class="result-dl">⬇ .txt</div>
+    </a>`).join('');
+}
+
 async function checkStatus(){
   if(!jobId) return;
   const r = await fetch('/status/'+jobId);
@@ -274,6 +307,7 @@ async function checkStatus(){
   setStatus(j.status);
   $('log').textContent = j.log.join('\n');
   $('log').scrollTop = $('log').scrollHeight;
+  renderResults(j.files);
   if(['done','error','cancelled'].includes(j.status)){
     clearInterval(poll); setActive(false);
     $('dl').disabled = !j.has_zip;
