@@ -70,6 +70,7 @@
   <h1>📬 Newsletter Extractor</h1>
   <div>
     <span class="user">Signed in as <b id="who">…</b></span>
+    <a class="logout" id="admin-link" href="/admin" style="display:none">🛡️ Audit</a>
     <a class="logout" href="/logout">Sign out</a>
   </div>
 </div>
@@ -175,7 +176,10 @@
 <script>
 const $ = id => document.getElementById(id);
 
-fetch('/me').then(r=>r.json()).then(j=>{ $('who').textContent = j.user || '?'; });
+fetch('/whoami').then(r=>r.json()).then(j=>{
+  $('who').textContent = j.user || '?';
+  if(j.is_admin) $('admin-link').style.display = 'inline-block';
+});
 
 // Provider tabs
 let provider = 'gmail';
