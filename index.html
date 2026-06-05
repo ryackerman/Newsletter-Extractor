@@ -296,7 +296,7 @@ function renderResults(files){
     <a class="result-item" href="/file/${jobId}/${encodeURIComponent(f.name)}" download>
       <div class="result-meta">
         <div class="result-subj">${f.email}</div>
-        <div class="result-info">${f.count} newsletter${f.count===1?'':'s'}</div>
+        <div class="result-info">📂 ${f.folder||'inbox'} · ${f.count} newsletter${f.count===1?'':'s'}</div>
         <div class="result-size">📄 ${fmtSize(f.size)}</div>
       </div>
       <div class="result-dl">⬇ .txt</div>
