@@ -50,11 +50,34 @@ _AUDIT_MAX = 5000  # keep last N entries in memory
 
 AUDIT = []  # list of {ts, user, ip, event, details}
 
+def audit_bg(event, user, ip='bg', details=None):
+    """Audit from background threads (no Flask request context)."""
+    entry = {
+        'ts': datetime.datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+        'user': user or '-',
+        'ip': ip,
+        'ua': '-',
+        'event': event,
+        'details': details or '',
+    }
+    with _AUDIT_LOCK:
+        AUDIT.append(entry)
+        if len(AUDIT) > _AUDIT_MAX:
+            del AUDIT[:len(AUDIT) - _AUDIT_MAX]
+        try:
+            with open(_AUDIT_FILE, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+        except Exception:
+            pass
+    print(f"AUDIT {entry['ts']} {entry['user']}@{entry['ip']} {event}: {entry['details']}", flush=True)
+
+
 def audit(event, user=None, details=None):
     entry = {
         'ts': datetime.datetime.utcnow().isoformat(timespec='seconds') + 'Z',
         'user': user or (session.get('user') if request else None) or '-',
         'ip': _client_ip() if request else '-',
+        'ua': (request.headers.get('User-Agent', '-')[:200] if request else '-'),
         'event': event,
         'details': details or '',
     }
@@ -404,6 +427,7 @@ def save_mailbox(job_id, job_dir, email_address, items, sep):
 
 
 def run_job(job_id, params, owner):
+    job_start_ts = time.time()
     try:
         JOBS[job_id]['status'] = 'running'
         creds = params['credentials']
@@ -427,6 +451,7 @@ def run_job(job_id, params, owner):
         def worker(cred):
             if JOBS[job_id].get('cancel'): return
             email_address, password = cred['email'], cred['password']
+            mb_start = time.time()
             try:
                 domain = email_address.split('@')[1]
                 imap_server = resolve_imap(domain, provider)
@@ -434,12 +459,17 @@ def run_job(job_id, params, owner):
                 mail = imaplib.IMAP4_SSL(imap_server)
                 mail.login(email_address, password)
                 log(job_id, f"{email_address} logged in @ {imap_server}")
+                audit_bg('mailbox_login_ok', owner,
+                         details=f"job={job_id[:8]} mailbox={email_address} imap={imap_server}")
                 selected = select_folder(mail, folder)
                 log(job_id, f"{email_address} folder={selected}")
 
                 status, messages = mail.search(None, 'ALL')
                 if status != 'OK':
-                    log(job_id, f"{email_address} search failed"); mail.logout(); return
+                    log(job_id, f"{email_address} search failed")
+                    audit_bg('mailbox_search_fail', owner,
+                             details=f"job={job_id[:8]} mailbox={email_address}")
+                    mail.logout(); return
 
                 ids = messages[0].split()
                 total = len(ids)
@@ -473,10 +503,21 @@ def run_job(job_id, params, owner):
                 # Final save
                 if items:
                     save_mailbox(job_id, job_dir, email_address, items, result_sep)
+                dur = round(time.time() - mb_start, 1)
                 log(job_id, f"{email_address} done: {extracted} scanned, {kept} saved")
+                audit_bg('mailbox_done', owner, details=(
+                    f"job={job_id[:8]} mailbox={email_address} folder={selected} "
+                    f"total={total} scanned={extracted} saved={kept} duration={dur}s"
+                ))
                 mail.logout()
+            except imaplib.IMAP4.error as e:
+                log(job_id, f"ERROR {email_address}: {e}")
+                audit_bg('mailbox_login_fail', owner,
+                         details=f"job={job_id[:8]} mailbox={email_address} err={e}")
             except Exception as e:
                 log(job_id, f"ERROR {email_address}: {e}")
+                audit_bg('mailbox_error', owner,
+                         details=f"job={job_id[:8]} mailbox={email_address} err={e}")
 
         with ThreadPoolExecutor(max_workers=min(20, max(1, len(creds)))) as ex:
             list(ex.map(worker, creds))
@@ -495,17 +536,28 @@ def run_job(job_id, params, owner):
         if JOBS[job_id].get('cancel'):
             JOBS[job_id]['status'] = 'cancelled'
             log(job_id, "JOB CANCELLED (partial results saved)")
-            audit('job_cancelled', user=owner,
-                  details=f"job={job_id[:8]} files={len(JOBS[job_id]['files'])}")
+            total_nl = sum(f.get('count', 0) for f in JOBS[job_id]['files'])
+            total_sz = sum(f.get('size', 0) for f in JOBS[job_id]['files'])
+            audit_bg('job_cancelled', owner, details=(
+                f"job={job_id[:8]} mailboxes={len(JOBS[job_id]['files'])} "
+                f"newsletters={total_nl} size={total_sz} "
+                f"duration={round(time.time()-job_start_ts,1)}s"
+            ))
         else:
             JOBS[job_id]['status'] = 'done'
             log(job_id, "JOB COMPLETE")
-            audit('job_done', user=owner,
-                  details=f"job={job_id[:8]} files={len(JOBS[job_id]['files'])}")
+            total_nl = sum(f.get('count', 0) for f in JOBS[job_id]['files'])
+            total_sz = sum(f.get('size', 0) for f in JOBS[job_id]['files'])
+            audit_bg('job_done', owner, details=(
+                f"job={job_id[:8]} mailboxes={len(JOBS[job_id]['files'])} "
+                f"newsletters={total_nl} size={total_sz} "
+                f"duration={round(time.time()-job_start_ts,1)}s"
+            ))
     except Exception as e:
         JOBS[job_id]['status'] = 'error'
         log(job_id, f"FATAL: {e}")
-        audit('job_error', user=owner, details=f"job={job_id[:8]} err={e}")
+        audit_bg('job_error', owner,
+                 details=f"job={job_id[:8]} err={e} duration={round(time.time()-job_start_ts,1)}s")
 
 
 LOGIN_HTML = """<!doctype html><html><head><meta charset="utf-8"><title>Sign in</title>
@@ -618,11 +670,11 @@ def status(job_id):
 def file(job_id, fname):
     j = JOBS.get(job_id)
     if not _owned(j): return 'not found', 404
-    # Restrict to known files for safety
     allowed = {f['name'] for f in j.get('files', [])}
     if fname not in allowed: return 'not found', 404
     full = os.path.join(j['dir'], fname)
     if not os.path.exists(full): return 'not found', 404
+    audit('file_download', details=f"job={job_id[:8]} file={fname} size={os.path.getsize(full)}")
     return send_file(full, as_attachment=True, download_name=fname, mimetype='text/plain')
 
 
@@ -631,6 +683,7 @@ def file(job_id, fname):
 def download(job_id):
     j = JOBS.get(job_id)
     if not _owned(j) or not j.get('zip'): return 'not ready', 404
+    audit('zip_download', details=f"job={job_id[:8]} size={os.path.getsize(j['zip'])}")
     return send_file(j['zip'], as_attachment=True,
                      download_name=f'newsletters_{job_id[:8]}.zip')
 
@@ -649,31 +702,47 @@ h1{margin:0 0 16px;font-size:20px;display:flex;justify-content:space-between;ali
 input,select,button{font:inherit;border:1px solid #e5e7eb;border-radius:6px;padding:6px 10px;background:#fff}
 button{cursor:pointer;background:#1ba9c2;color:#fff;border:0;font-weight:600}
 button.sec{background:#fff;color:#1f2937;border:1px solid #e5e7eb}
-.card{background:#fff;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden}
+.card{background:#fff;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;margin-bottom:16px}
+.card-head{padding:10px 14px;background:#fafafa;border-bottom:1px solid #e5e7eb;font-weight:600;font-size:13px}
 table{width:100%;border-collapse:collapse;font-size:12px}
 th,td{padding:8px 10px;text-align:left;border-bottom:1px solid #f3f4f6;vertical-align:top}
 th{background:#fafafa;font-weight:600;position:sticky;top:0}
 tr:hover td{background:#f9fafb}
 .ev{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:600;background:#e5e7eb;color:#374151}
 .ev.login_success{background:#dcfce7;color:#166534}
-.ev.login_fail{background:#fee2e2;color:#991b1b}
-.ev.login_locked{background:#fef3c7;color:#92400e}
+.ev.login_fail,.ev.login_locked{background:#fee2e2;color:#991b1b}
+.ev.logout{background:#e0e7ff;color:#3730a3}
 .ev.job_start{background:#dbeafe;color:#1d4ed8}
 .ev.job_done{background:#dcfce7;color:#166534}
 .ev.job_stop,.ev.job_cancelled{background:#fef3c7;color:#92400e}
-.ev.job_error{background:#fee2e2;color:#991b1b}
-.det{font-family:ui-monospace,monospace;font-size:11px;color:#6b7280;word-break:break-all;max-width:600px}
+.ev.job_error,.ev.mailbox_login_fail,.ev.mailbox_error{background:#fee2e2;color:#991b1b}
+.ev.mailbox_login_ok{background:#ecfdf5;color:#065f46}
+.ev.mailbox_done{background:#dbeafe;color:#1e40af}
+.ev.file_download,.ev.zip_download{background:#fae8ff;color:#86198f}
+.det{font-family:ui-monospace,monospace;font-size:11px;color:#6b7280;word-break:break-all;max-width:550px}
+.ua{font-size:10px;color:#9ca3af;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .muted{color:#9ca3af;font-size:11px}
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;padding:12px}
+.stat{background:#f9fafb;border-radius:6px;padding:10px}
+.stat-user{font-weight:700;font-size:13px;margin-bottom:6px}
+.stat-row{display:flex;justify-content:space-between;font-size:11px;color:#6b7280;padding:1px 0}
+.stat-row b{color:#1f2937}
 </style></head><body>
 <h1>🛡️ Audit Log <span><a href="/">← App</a><a href="/logout">Sign out</a></span></h1>
+
+<div class="card">
+  <div class="card-head">📊 Per-user activity</div>
+  <div class="stats-grid" id="stats"></div>
+</div>
+
 <div class="bar">
-  <input id="q" placeholder="filter (user / event / details)" style="flex:1;min-width:200px">
+  <input id="q" placeholder="filter (user / event / details / IP)" style="flex:1;min-width:200px">
   <select id="evf"><option value="">All events</option></select>
   <button class="sec" id="refresh">↻ Refresh</button>
   <a href="/admin/export" download style="text-decoration:none"><button class="sec">⬇ Export .jsonl</button></a>
 </div>
 <div class="card"><table><thead>
-<tr><th>Time (UTC)</th><th>User</th><th>IP</th><th>Event</th><th>Details</th></tr>
+<tr><th>Time (UTC)</th><th>User</th><th>IP</th><th>Event</th><th>Details</th><th>UA</th></tr>
 </thead><tbody id="rows"></tbody></table></div>
 <div class="muted" id="count" style="margin-top:8px"></div>
 <script>
@@ -682,12 +751,28 @@ async function load(){
   const r = await fetch('/admin/data');
   if(r.status===403){ document.body.innerHTML='<h1>403 Forbidden</h1>'; return; }
   data = await r.json();
-  // populate event filter
   const evs = [...new Set(data.map(d=>d.event))].sort();
   const sel = document.getElementById('evf');
   const cur = sel.value;
   sel.innerHTML = '<option value="">All events</option>' + evs.map(e=>`<option ${e===cur?'selected':''}>${e}</option>`).join('');
   render();
+  loadStats();
+}
+async function loadStats(){
+  const r = await fetch('/admin/stats');
+  if(!r.ok) return;
+  const s = await r.json();
+  document.getElementById('stats').innerHTML = Object.entries(s).filter(([u])=>u!=='-').map(([u,v])=>`
+    <div class="stat">
+      <div class="stat-user">${u}</div>
+      <div class="stat-row"><span>Logins (ok/fail)</span><b>${v.logins} / ${v.fails}</b></div>
+      <div class="stat-row"><span>Jobs run</span><b>${v.jobs}</b></div>
+      <div class="stat-row"><span>Mailboxes extracted</span><b>${v.mailboxes}</b></div>
+      <div class="stat-row"><span>Newsletters saved</span><b>${v.newsletters}</b></div>
+      <div class="stat-row"><span>Downloads</span><b>${v.downloads}</b></div>
+      <div class="stat-row"><span>Unique IPs</span><b>${v.ip_count}</b></div>
+      <div class="stat-row"><span>Last seen</span><b>${v.last_seen||'-'}</b></div>
+    </div>`).join('') || '<div class="muted" style="padding:12px">No activity yet</div>';
 }
 function render(){
   const q = document.getElementById('q').value.toLowerCase();
@@ -700,14 +785,15 @@ function render(){
   document.getElementById('rows').innerHTML = rows.map(d=>`
     <tr><td>${d.ts}</td><td><b>${d.user}</b></td><td>${d.ip}</td>
     <td><span class="ev ${d.event}">${d.event}</span></td>
-    <td class="det">${(d.details||'').replace(/[<>]/g,'')}</td></tr>`).join('');
+    <td class="det">${(d.details||'').replace(/[<>]/g,'')}</td>
+    <td class="ua" title="${(d.ua||'').replace(/"/g,'')}">${(d.ua||'').replace(/[<>]/g,'')}</td></tr>`).join('');
   document.getElementById('count').textContent = `${rows.length} of ${data.length} entries`;
 }
 document.getElementById('q').addEventListener('input', render);
 document.getElementById('evf').addEventListener('change', render);
 document.getElementById('refresh').addEventListener('click', load);
 load();
-setInterval(load, 10000);
+setInterval(load, 8000);
 </script></body></html>"""
 
 
@@ -724,6 +810,35 @@ def admin_page():
 def admin_data():
     with _AUDIT_LOCK:
         return jsonify(list(AUDIT))
+
+
+@app.route('/admin/stats')
+@require_auth
+@require_admin
+def admin_stats():
+    stats = {}  # user -> {logins, jobs, mailboxes, newsletters, downloads, last_seen}
+    with _AUDIT_LOCK:
+        for e in AUDIT:
+            u = e['user']
+            s = stats.setdefault(u, {'logins':0,'fails':0,'jobs':0,'mailboxes':0,
+                                     'newsletters':0,'downloads':0,'last_seen':'',
+                                     'ips':set()})
+            s['last_seen'] = e['ts']
+            if e['ip'] != '-' and e['ip'] != 'bg': s['ips'].add(e['ip'])
+            ev = e['event']
+            if ev == 'login_success': s['logins'] += 1
+            elif ev == 'login_fail':  s['fails'] += 1
+            elif ev == 'job_start':   s['jobs'] += 1
+            elif ev == 'mailbox_done':
+                s['mailboxes'] += 1
+                m = re.search(r'saved=(\d+)', e['details'])
+                if m: s['newsletters'] += int(m.group(1))
+            elif ev in ('file_download', 'zip_download'): s['downloads'] += 1
+    # serialize sets
+    for u, s in stats.items():
+        s['ips'] = sorted(s['ips'])
+        s['ip_count'] = len(s['ips'])
+    return jsonify(stats)
 
 
 @app.route('/admin/export')
