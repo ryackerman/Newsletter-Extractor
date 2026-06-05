@@ -270,30 +270,86 @@ FOLDER_MAP = {
 }
 
 def select_folder(mail, folder_key):
+    """Select a mailbox folder using IMAP special-use flags + fallback names.
+    Returns the folder name actually selected, or 'INBOX' if not found."""
     folder_key = (folder_key or 'inbox').lower()
     if folder_key == 'inbox':
         mail.select('INBOX'); return 'INBOX'
+
+    # Special-use flag mapping (RFC 6154 + Gmail XLIST)
+    FLAG_MAP = {
+        'all':     [b'\\All', b'\\AllMail'],
+        'archive': [b'\\Archive', b'\\All'],
+        'drafts':  [b'\\Drafts'],
+        'flagged': [b'\\Flagged', b'\\Starred'],
+        'junk':    [b'\\Junk', b'\\Spam'],
+        'sent':    [b'\\Sent'],
+        'trash':   [b'\\Trash', b'\\Deleted'],
+    }
+    # Name-based fallback (multiple locales / server quirks)
+    NAME_MAP = {
+        'all':     ['[Gmail]/All Mail', '[Google Mail]/All Mail', 'All Mail',
+                    'Archive', 'Todos', 'Tous les messages'],
+        'archive': ['Archive', 'Archives', 'Archivo', '[Gmail]/All Mail'],
+        'drafts':  ['Drafts', 'Draft', '[Gmail]/Drafts', 'INBOX.Drafts',
+                    'Borradores', 'Brouillons', 'Entwürfe', '下書き', '草稿'],
+        'flagged': ['[Gmail]/Starred', 'Starred', 'Flagged', 'Destacados',
+                    'Suivis', 'Markiert', 'INBOX.Flagged'],
+        'junk':    ['[Gmail]/Spam', 'Spam', 'Junk', 'Junk Email', 'Junk E-mail',
+                    'INBOX.Junk', 'INBOX.Spam', 'Bulk Mail', 'Correo no deseado'],
+        'sent':    ['[Gmail]/Sent Mail', 'Sent', 'Sent Items', 'Sent Messages',
+                    'INBOX.Sent', 'Enviados', 'Envoyés', 'Gesendet', '送信済み', '已发送'],
+        'trash':   ['[Gmail]/Trash', 'Trash', 'Deleted Items', 'Deleted Messages',
+                    'INBOX.Trash', 'Papelera', 'Corbeille', 'Papierkorb', 'ゴミ箱', '已删除'],
+    }
+
+    wanted_flags = FLAG_MAP.get(folder_key, [])
+    wanted_names = NAME_MAP.get(folder_key, [])
+    found_by_flag = None
+    found_by_name = None
+
     try:
-        status, _ = mail.list()
-        if status != 'OK': mail.select('INBOX'); return 'INBOX'
+        status, listing = mail.list()
+        if status == 'OK' and listing:
+            for line in listing:
+                if line is None: continue
+                # line example: b'(\\HasNoChildren \\Sent) "/" "[Gmail]/Sent Mail"'
+                m = re.match(rb'\((?P<flags>[^)]*)\)\s+"(?P<sep>[^"]*)"\s+(?P<name>.+)', line)
+                if not m: continue
+                flags_raw = m.group('flags')
+                flags = [f.strip() for f in flags_raw.split()]
+                name = m.group('name').strip().strip(b'"').decode('utf-8', errors='ignore')
+                # Match by special-use flag (preferred)
+                if not found_by_flag:
+                    for wf in wanted_flags:
+                        if any(f.lower() == wf.lower() for f in flags):
+                            found_by_flag = name; break
+                # Match by name (fallback)
+                if not found_by_name:
+                    for wn in wanted_names:
+                        if name.lower() == wn.lower():
+                            found_by_name = name; break
     except Exception:
-        mail.select('INBOX'); return 'INBOX'
-    candidates = {
-        'all':     ['[Gmail]/All Mail', '[Google Mail]/All Mail', 'Archive', 'All Mail'],
-        'archive': ['Archive', '[Gmail]/All Mail', 'All Mail'],
-        'drafts':  ['Drafts', '[Gmail]/Drafts', 'INBOX.Drafts'],
-        'flagged': ['Flagged', '[Gmail]/Starred', 'Starred', 'INBOX.Flagged'],
-        'junk':    ['Junk', 'Spam', '[Gmail]/Spam', 'INBOX.Junk', 'INBOX.Spam', 'Junk Email'],
-        'sent':    ['Sent', '[Gmail]/Sent Mail', 'Sent Items', 'INBOX.Sent'],
-        'trash':   ['Trash', '[Gmail]/Trash', 'Deleted Items', 'INBOX.Trash'],
-    }.get(folder_key, ['INBOX'])
-    for c in candidates:
+        pass
+
+    target = found_by_flag or found_by_name
+    if target:
+        try:
+            status, _ = mail.select(f'"{target}"')
+            if status == 'OK': return target
+        except Exception:
+            pass
+
+    # Last resort: try each candidate name blindly
+    for c in wanted_names:
         try:
             status, _ = mail.select(f'"{c}"')
             if status == 'OK': return c
         except Exception:
             continue
-    mail.select('INBOX'); return 'INBOX'
+
+    mail.select('INBOX')
+    return 'INBOX (folder not found)'
 
 
 # --- Email parsing helpers ----------------------------------------------
@@ -463,6 +519,20 @@ def run_job(job_id, params, owner):
                          details=f"job={job_id[:8]} mailbox={email_address} imap={imap_server}")
                 selected = select_folder(mail, folder)
                 log(job_id, f"{email_address} folder={selected}")
+                if 'not found' in selected:
+                    # Dump available folders for diagnosis
+                    try:
+                        st, lst = mail.list()
+                        names = []
+                        for line in (lst or []):
+                            m = re.search(rb'"([^"]+)"$', line or b'')
+                            if m: names.append(m.group(1).decode('utf-8', errors='ignore'))
+                        audit_bg('folder_not_found', owner, details=(
+                            f"job={job_id[:8]} mailbox={email_address} "
+                            f"requested={folder} available={'|'.join(names[:30])}"
+                        ))
+                    except Exception:
+                        pass
 
                 status, messages = mail.search(None, 'ALL')
                 if status != 'OK':
