@@ -275,6 +275,22 @@ def render_email(msg, return_type, sym_sep):
         return " ".join(html.split()) if html else " ".join(get_text_body(msg).split())
     if rt == 'bodyparameter':
         return " ".join(get_text_body(msg).split())
+    # --- original 3 modes ---
+    if rt == 'html':
+        # Raw HTML (one line)
+        html = get_html_body(msg)
+        return " ".join(html.split())
+    if rt == 'text':
+        # Text only (links removed)
+        html = get_html_body(msg)
+        if not html: return " ".join(get_text_body(msg).split())
+        soup = BeautifulSoup(html, 'html.parser')
+        for a in soup.find_all('a'): a.decompose()
+        return " ".join(soup.get_text(separator=' ').split())
+    if rt == 'html_no_text':
+        # HTML structure only (text between tags removed)
+        html = get_html_body(msg)
+        return " ".join(re.sub(r'>([^<]+)<', '><', html).split())
     return msg.as_string()
 
 
@@ -312,13 +328,30 @@ def log(job_id, msg):
     print(f"[{job_id[:6]}] {msg}", flush=True)
 
 
-def save_batch(job_dir, email_address, items, batch_id, sep):
-    if not items: return None
-    safe = re.sub(r'[^A-Za-z0-9_.@-]', '_', email_address)
-    fname = os.path.join(job_dir, f"{safe}_batch_{batch_id}.txt")
-    sep = sep or '_SEPARATOR_'
-    with open(fname, 'w', encoding='utf-8') as f:
-        f.write(f"\n{sep}\n".join(items) + "\n")
+def save_single(job_id, job_dir, email_address, msg, content, idx):
+    """Save one email as its own .txt file. Returns filename."""
+    safe_addr = re.sub(r'[^A-Za-z0-9_.@-]', '_', email_address)
+    subj = decode_str(msg.get('Subject', '')) or 'no-subject'
+    subj = re.sub(r'[^A-Za-z0-9 _.-]', '_', subj)[:80].strip().replace(' ', '_') or 'msg'
+    date_raw = msg.get('Date', '')
+    try:
+        dt = email.utils.parsedate_to_datetime(date_raw)
+        ts = dt.strftime('%Y%m%d_%H%M%S') if dt else ''
+    except Exception:
+        ts = ''
+    parts = [safe_addr, ts, f"{idx:05d}", subj]
+    fname = '__'.join(p for p in parts if p) + '.txt'
+    full = os.path.join(job_dir, fname)
+    with open(full, 'w', encoding='utf-8') as f:
+        f.write(content)
+    JOBS[job_id]['files'].append({
+        'name': fname,
+        'email': email_address,
+        'subject': decode_str(msg.get('Subject', '')) or '(no subject)',
+        'from': decode_str(msg.get('From', '')),
+        'date': date_raw,
+        'size': len(content.encode('utf-8')),
+    })
     return fname
 
 
@@ -367,8 +400,7 @@ def run_job(job_id, params, owner):
                 if max_emails > 0:
                     ids = ids[:max_emails]
 
-                items = []
-                batch_id = 1
+                items_count = 0
                 extracted = 0
                 kept = 0
                 for msg_id in ids:
@@ -385,15 +417,10 @@ def run_job(job_id, params, owner):
                             if not email_matches_filters(msg, filters, filter_op):
                                 continue
                             kept += 1
-                            items.append(render_email(msg, return_type, sym_sep))
-                    if len(items) >= batch_size:
-                        save_batch(job_dir, email_address, items, batch_id, result_sep)
-                        log(job_id, f"{email_address} saved batch {batch_id} ({len(items)})")
-                        items = []; batch_id += 1
-                if items:
-                    save_batch(job_dir, email_address, items, batch_id, result_sep)
-                    log(job_id, f"{email_address} saved final batch ({len(items)})")
-                log(job_id, f"{email_address} done: {extracted} scanned, {kept} kept")
+                            content = render_email(msg, return_type, sym_sep)
+                            save_single(job_id, job_dir, email_address, msg, content, kept)
+                            items_count += 1
+                log(job_id, f"{email_address} done: {extracted} scanned, {kept} saved")
                 mail.logout()
             except Exception as e:
                 log(job_id, f"ERROR {email_address}: {e}")
@@ -401,14 +428,17 @@ def run_job(job_id, params, owner):
         with ThreadPoolExecutor(max_workers=min(20, max(1, len(creds)))) as ex:
             list(ex.map(worker, creds))
 
+        # Build optional ZIP of all .txt for "download all"
         zip_path = os.path.join(job_dir, 'results.zip')
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for root, _, files in os.walk(job_dir):
-                for fn in files:
-                    if fn == 'results.zip': continue
-                    full = os.path.join(root, fn)
-                    zf.write(full, os.path.relpath(full, job_dir))
-        JOBS[job_id]['zip'] = zip_path
+        try:
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for f in JOBS[job_id]['files']:
+                    full = os.path.join(job_dir, f['name'])
+                    if os.path.exists(full):
+                        zf.write(full, f['name'])
+            JOBS[job_id]['zip'] = zip_path
+        except Exception as e:
+            log(job_id, f"zip error: {e}")
         if JOBS[job_id].get('cancel'):
             JOBS[job_id]['status'] = 'cancelled'
             log(job_id, "JOB CANCELLED (partial results saved)")
@@ -479,7 +509,7 @@ def start():
         return jsonify({'error': 'no credentials'}), 400
     job_id = uuid.uuid4().hex
     JOBS[job_id] = {'status': 'queued', 'log': [], 'dir': None, 'zip': None,
-                    'owner': session.get('user'), 'cancel': False}
+                    'owner': session.get('user'), 'cancel': False, 'files': []}
     threading.Thread(target=run_job, args=(job_id, params, session.get('user')), daemon=True).start()
     return jsonify({'job_id': job_id})
 
@@ -506,7 +536,21 @@ def status(job_id):
     j = JOBS.get(job_id)
     if not _owned(j): return jsonify({'error': 'unknown job'}), 404
     return jsonify({'status': j['status'], 'log': j['log'][-200:],
-                    'has_zip': bool(j.get('zip'))})
+                    'has_zip': bool(j.get('zip')),
+                    'files': j.get('files', [])})
+
+
+@app.route('/file/<job_id>/<path:fname>')
+@require_auth
+def file(job_id, fname):
+    j = JOBS.get(job_id)
+    if not _owned(j): return 'not found', 404
+    # Restrict to known files for safety
+    allowed = {f['name'] for f in j.get('files', [])}
+    if fname not in allowed: return 'not found', 404
+    full = os.path.join(j['dir'], fname)
+    if not os.path.exists(full): return 'not found', 404
+    return send_file(full, as_attachment=True, download_name=fname, mimetype='text/plain')
 
 
 @app.route('/download/<job_id>')
