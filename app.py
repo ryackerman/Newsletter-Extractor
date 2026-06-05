@@ -2,6 +2,8 @@
 Newsletter Extractor - Flask backend (Render-ready, multi-user)
 """
 import os, re, imaplib, email, socket, datetime, threading, uuid, secrets, hmac, time, json
+import urllib.request, ssl as _ssl
+from email.header import decode_header
 from functools import wraps
 from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
@@ -14,16 +16,10 @@ app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE='Lax',
     SESSION_COOKIE_SECURE=bool(os.environ.get('RENDER')),
-    PERMANENT_SESSION_LIFETIME=86400,  # 24h
+    PERMANENT_SESSION_LIFETIME=86400,
 )
 
 # --- USERS --------------------------------------------------------------
-# Source priority:
-#   1) APP_USERS env var: JSON  {"alice":"pw1","bob":"pw2"}
-#   2) APP_USERS env var: CSV   "alice:pw1,bob:pw2"
-#   3) Legacy APP_USER/APP_PASS (single user)
-#   4) Default admin:changeme
-
 def _load_users():
     raw = os.environ.get('APP_USERS', '').strip()
     if raw:
@@ -32,7 +28,6 @@ def _load_users():
             if isinstance(d, dict): return {str(k): str(v) for k, v in d.items()}
         except Exception:
             pass
-        # CSV fallback
         out = {}
         for pair in raw.split(','):
             if ':' in pair:
@@ -66,7 +61,6 @@ def _fail(ip):
 def _check(u, p):
     expected = USERS.get(u)
     if expected is None:
-        # constant-time dummy compare to avoid user-enum timing
         hmac.compare_digest('x', 'y'); return False
     return hmac.compare_digest(p, expected)
 
@@ -74,12 +68,11 @@ def require_auth(f):
     @wraps(f)
     def wrap(*a, **kw):
         if not session.get('user'):
-            if request.path.startswith(('/start', '/status', '/download')) or request.is_json:
+            if request.path.startswith(('/start', '/status', '/download', '/stop', '/me')) or request.is_json:
                 return jsonify({'error': 'unauthorized'}), 401
             return redirect(url_for('login_page'))
         return f(*a, **kw)
     return wrap
-# ------------------------------------------------------------------------
 
 JOBS = {}
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -87,102 +80,45 @@ OUT_ROOT = os.path.join('/tmp' if os.environ.get('RENDER') else HERE, 'newslette
 os.makedirs(OUT_ROOT, exist_ok=True)
 
 
-def get_imap_server(domain):
-    return resolve_imap(domain)
-
-
 # --- IMAP autodiscovery -------------------------------------------------
-# Strategy:
-#  1) Built-in table for known providers (incl. Japanese & big ISPs)
-#  2) Mozilla ISPDB (autoconfig)
-#  3) Thunderbird-style autoconfig DNS:  autoconfig.<domain>/mail/config-v1.1.xml
-#  4) DNS SRV record _imaps._tcp.<domain>
-#  5) Common-pattern probes: imap.<domain>, mail.<domain>, etc.
-
-import urllib.request, ssl as _ssl
-
 _IMAP_CACHE = {}
 
 KNOWN_IMAP = {
-    # Global
-    'gmail.com': 'imap.gmail.com',
-    'googlemail.com': 'imap.gmail.com',
-    'yahoo.com': 'imap.mail.yahoo.com',
-    'yahoo.co.jp': 'imap.mail.yahoo.co.jp',
-    'ymail.com': 'imap.mail.yahoo.com',
-    'rocketmail.com': 'imap.mail.yahoo.com',
-    'outlook.com': 'outlook.office365.com',
-    'hotmail.com': 'outlook.office365.com',
-    'live.com': 'outlook.office365.com',
-    'msn.com': 'outlook.office365.com',
+    'gmail.com': 'imap.gmail.com', 'googlemail.com': 'imap.gmail.com',
+    'yahoo.com': 'imap.mail.yahoo.com', 'yahoo.co.jp': 'imap.mail.yahoo.co.jp',
+    'ymail.com': 'imap.mail.yahoo.com', 'rocketmail.com': 'imap.mail.yahoo.com',
+    'outlook.com': 'outlook.office365.com', 'hotmail.com': 'outlook.office365.com',
+    'live.com': 'outlook.office365.com', 'msn.com': 'outlook.office365.com',
     'office365.com': 'outlook.office365.com',
     'aol.com': 'imap.aol.com',
-    'icloud.com': 'imap.mail.me.com',
-    'me.com': 'imap.mail.me.com',
-    'mac.com': 'imap.mail.me.com',
-    'proton.me': '127.0.0.1',  # ProtonMail requires Bridge
-    'protonmail.com': '127.0.0.1',
-    'tutanota.com': None,  # no IMAP
-    'zoho.com': 'imap.zoho.com',
-    'zohomail.com': 'imap.zoho.com',
-    'gmx.com': 'imap.gmx.com',
-    'gmx.net': 'imap.gmx.net',
-    'gmx.de': 'imap.gmx.net',
+    'icloud.com': 'imap.mail.me.com', 'me.com': 'imap.mail.me.com', 'mac.com': 'imap.mail.me.com',
+    'zoho.com': 'imap.zoho.com', 'zohomail.com': 'imap.zoho.com',
+    'gmx.com': 'imap.gmx.com', 'gmx.net': 'imap.gmx.net', 'gmx.de': 'imap.gmx.net',
     'mail.com': 'imap.mail.com',
-    'fastmail.com': 'imap.fastmail.com',
-    'fastmail.fm': 'imap.fastmail.com',
-    'yandex.com': 'imap.yandex.com',
-    'yandex.ru': 'imap.yandex.ru',
-    'mail.ru': 'imap.mail.ru',
-    'inbox.ru': 'imap.mail.ru',
-    'list.ru': 'imap.mail.ru',
-    'bk.ru': 'imap.mail.ru',
-    # Japan
-    'ezweb.ne.jp': 'imap.au.com',
-    'au.com': 'imap.au.com',
-    'docomo.ne.jp': 'imap.spmode.ne.jp',
-    'spmode.ne.jp': 'imap.spmode.ne.jp',
-    'softbank.ne.jp': 'imap.softbank.jp',
-    'i.softbank.jp': 'imap.softbank.jp',
-    'nifty.com': 'imap.nifty.com',
-    'so-net.ne.jp': 'mail.so-net.ne.jp',
-    'biglobe.ne.jp': 'mail.biglobe.ne.jp',
-    'ocn.ne.jp': 'imap.ocn.ne.jp',
-    'plala.or.jp': 'imap.plala.or.jp',
-    'ybb.ne.jp': 'imap.ybb.ne.jp',
+    'fastmail.com': 'imap.fastmail.com', 'fastmail.fm': 'imap.fastmail.com',
+    'yandex.com': 'imap.yandex.com', 'yandex.ru': 'imap.yandex.ru',
+    'mail.ru': 'imap.mail.ru', 'inbox.ru': 'imap.mail.ru', 'list.ru': 'imap.mail.ru', 'bk.ru': 'imap.mail.ru',
+    'ezweb.ne.jp': 'imap.au.com', 'au.com': 'imap.au.com',
+    'docomo.ne.jp': 'imap.spmode.ne.jp', 'spmode.ne.jp': 'imap.spmode.ne.jp',
+    'softbank.ne.jp': 'imap.softbank.jp', 'i.softbank.jp': 'imap.softbank.jp',
+    'nifty.com': 'imap.nifty.com', 'so-net.ne.jp': 'mail.so-net.ne.jp',
+    'biglobe.ne.jp': 'mail.biglobe.ne.jp', 'ocn.ne.jp': 'imap.ocn.ne.jp',
+    'plala.or.jp': 'imap.plala.or.jp', 'ybb.ne.jp': 'imap.ybb.ne.jp',
     'excite.co.jp': 'mail.excite.co.jp',
-    # Germany / EU
-    't-online.de': 'secureimap.t-online.de',
-    'web.de': 'imap.web.de',
-    '1und1.de': 'imap.1und1.de',
-    'freenet.de': 'mx.freenet.de',
-    'mailbox.org': 'imap.mailbox.org',
-    'posteo.de': 'posteo.de',
-    'orange.fr': 'imap.orange.fr',
-    'wanadoo.fr': 'imap.orange.fr',
-    'free.fr': 'imap.free.fr',
-    'laposte.net': 'imap.laposte.net',
-    'libero.it': 'imapmail.libero.it',
-    'tiscali.it': 'imap.tiscali.it',
-    # UK / other
-    'btinternet.com': 'mail.btinternet.com',
-    'sky.com': 'imap.tools.sky.com',
+    't-online.de': 'secureimap.t-online.de', 'web.de': 'imap.web.de',
+    '1und1.de': 'imap.1und1.de', 'freenet.de': 'mx.freenet.de',
+    'mailbox.org': 'imap.mailbox.org', 'posteo.de': 'posteo.de',
+    'orange.fr': 'imap.orange.fr', 'wanadoo.fr': 'imap.orange.fr',
+    'free.fr': 'imap.free.fr', 'laposte.net': 'imap.laposte.net',
+    'libero.it': 'imapmail.libero.it', 'tiscali.it': 'imap.tiscali.it',
+    'btinternet.com': 'mail.btinternet.com', 'sky.com': 'imap.tools.sky.com',
     'virginmedia.com': 'imap.virginmedia.com',
-    # US ISPs
-    'comcast.net': 'imap.comcast.net',
-    'verizon.net': 'imap.aol.com',
-    'att.net': 'imap.mail.att.net',
-    'sbcglobal.net': 'imap.mail.att.net',
-    'cox.net': 'imap.cox.net',
-    'charter.net': 'mobile.charter.net',
-    'optonline.net': 'mail.optonline.net',
-    'earthlink.net': 'imap.earthlink.net',
-    # India / others
-    'rediffmail.com': 'imap.rediffmail.com',
-    'sina.com': 'imap.sina.com',
-    'qq.com': 'imap.qq.com',
-    '163.com': 'imap.163.com',
-    '126.com': 'imap.126.com',
+    'comcast.net': 'imap.comcast.net', 'verizon.net': 'imap.aol.com',
+    'att.net': 'imap.mail.att.net', 'sbcglobal.net': 'imap.mail.att.net',
+    'cox.net': 'imap.cox.net', 'charter.net': 'mobile.charter.net',
+    'optonline.net': 'mail.optonline.net', 'earthlink.net': 'imap.earthlink.net',
+    'rediffmail.com': 'imap.rediffmail.com', 'sina.com': 'imap.sina.com',
+    'qq.com': 'imap.qq.com', '163.com': 'imap.163.com', '126.com': 'imap.126.com',
 }
 
 def _probe_imap(host, port=993, timeout=4):
@@ -199,7 +135,6 @@ def _try_ispdb(domain):
     urls = [
         f"https://autoconfig.thunderbird.net/v1.1/{domain}",
         f"https://autoconfig.{domain}/mail/config-v1.1.xml?emailaddress=user@{domain}",
-        f"http://autoconfig.{domain}/mail/config-v1.1.xml?emailaddress=user@{domain}",
     ]
     for url in urls:
         try:
@@ -211,22 +146,9 @@ def _try_ispdb(domain):
             if m:
                 h = re.search(r'<hostname>([^<]+)</hostname>', m.group(1))
                 if h:
-                    host = h.group(1).strip().replace('%EMAILDOMAIN%', domain)
-                    return host
+                    return h.group(1).strip().replace('%EMAILDOMAIN%', domain)
         except Exception:
             continue
-    return None
-
-def _try_dns_srv(domain):
-    try:
-        import dns.resolver  # optional
-        answers = dns.resolver.resolve(f'_imaps._tcp.{domain}', 'SRV', lifetime=4)
-        recs = sorted(answers, key=lambda r: (r.priority, -r.weight))
-        for r in recs:
-            host = str(r.target).rstrip('.')
-            if host and host != '.': return host
-    except Exception:
-        pass
     return None
 
 def _try_patterns(domain):
@@ -235,18 +157,20 @@ def _try_patterns(domain):
             return h
     return None
 
-def resolve_imap(domain):
+def resolve_imap(domain, provider_hint=None):
     domain = domain.lower().strip()
+    if provider_hint:
+        hint = provider_hint.lower()
+        if hint == 'gmail': return 'imap.gmail.com'
+        if hint == 'yahoo': return 'imap.mail.yahoo.com'
+        if hint == 'hotmail': return 'outlook.office365.com'
     if domain in _IMAP_CACHE: return _IMAP_CACHE[domain]
-
     if domain in KNOWN_IMAP:
         host = KNOWN_IMAP[domain]
-        if host is None:
-            raise Exception(f"{domain} does not support IMAP")
+        if host is None: raise Exception(f"{domain} does not support IMAP")
         _IMAP_CACHE[domain] = host
         return host
-
-    for fn in (_try_ispdb, _try_dns_srv, _try_patterns):
+    for fn in (_try_ispdb, _try_patterns):
         try:
             host = fn(domain)
             if host:
@@ -254,47 +178,147 @@ def resolve_imap(domain):
                 return host
         except Exception:
             continue
+    raise Exception(f"Could not autodiscover IMAP for {domain}")
 
-    raise Exception(f"Could not autodiscover IMAP for {domain}. Add it manually to KNOWN_IMAP.")
-# ------------------------------------------------------------------------
+
+# --- Folder mapping -----------------------------------------------------
+FOLDER_MAP = {
+    'inbox': 'INBOX',
+    'all': '[Gmail]/All Mail',
+    'archive': 'Archive',
+    'drafts': 'Drafts',
+    'flagged': 'Flagged',
+    'junk': 'Junk',
+    'sent': 'Sent',
+    'trash': 'Trash',
+}
+
+def select_folder(mail, folder_key):
+    folder_key = (folder_key or 'inbox').lower()
+    if folder_key == 'inbox':
+        mail.select('INBOX'); return 'INBOX'
+    try:
+        status, _ = mail.list()
+        if status != 'OK': mail.select('INBOX'); return 'INBOX'
+    except Exception:
+        mail.select('INBOX'); return 'INBOX'
+    candidates = {
+        'all':     ['[Gmail]/All Mail', '[Google Mail]/All Mail', 'Archive', 'All Mail'],
+        'archive': ['Archive', '[Gmail]/All Mail', 'All Mail'],
+        'drafts':  ['Drafts', '[Gmail]/Drafts', 'INBOX.Drafts'],
+        'flagged': ['Flagged', '[Gmail]/Starred', 'Starred', 'INBOX.Flagged'],
+        'junk':    ['Junk', 'Spam', '[Gmail]/Spam', 'INBOX.Junk', 'INBOX.Spam', 'Junk Email'],
+        'sent':    ['Sent', '[Gmail]/Sent Mail', 'Sent Items', 'INBOX.Sent'],
+        'trash':   ['Trash', '[Gmail]/Trash', 'Deleted Items', 'INBOX.Trash'],
+    }.get(folder_key, ['INBOX'])
+    for c in candidates:
+        try:
+            status, _ = mail.select(f'"{c}"')
+            if status == 'OK': return c
+        except Exception:
+            continue
+    mail.select('INBOX'); return 'INBOX'
+
+
+# --- Email parsing helpers ----------------------------------------------
+def decode_str(s):
+    if not s: return ''
+    try:
+        parts = decode_header(s)
+        return ''.join(
+            (p.decode(enc or 'utf-8', errors='ignore') if isinstance(p, bytes) else p)
+            for p, enc in parts)
+    except Exception:
+        return str(s)
+
+def get_html_body(msg):
+    for part in msg.walk():
+        if part.get_content_type() == 'text/html':
+            try:
+                return part.get_payload(decode=True).decode(
+                    part.get_content_charset() or 'utf-8', errors='ignore')
+            except Exception:
+                return ''
+    return ''
+
+def get_text_body(msg):
+    for part in msg.walk():
+        if part.get_content_type() == 'text/plain':
+            try:
+                return part.get_payload(decode=True).decode(
+                    part.get_content_charset() or 'utf-8', errors='ignore')
+            except Exception:
+                return ''
+    html = get_html_body(msg)
+    if html:
+        soup = BeautifulSoup(html, 'html.parser')
+        for a in soup.find_all('a'): a.decompose()
+        return soup.get_text(separator=' ')
+    return ''
+
+def header_str(msg, key):
+    return decode_str(msg.get(key, ''))
+
+def render_email(msg, return_type, sym_sep):
+    rt = (return_type or 'fullsource').lower()
+    if rt == 'fullsource':
+        try: return msg.as_string()
+        except Exception: return msg.as_bytes().decode('utf-8', errors='ignore')
+    if rt == 'fullheader':
+        return '\n'.join(f"{k}: {decode_str(v)}" for k, v in msg.items())
+    if rt == 'header':
+        keys = ('From', 'To', 'Subject', 'Date', 'Message-ID')
+        sep = sym_sep or ' | '
+        return sep.join(f"{k}: {header_str(msg, k)}" for k in keys)
+    if rt == 'body':
+        html = get_html_body(msg)
+        return " ".join(html.split()) if html else " ".join(get_text_body(msg).split())
+    if rt == 'bodyparameter':
+        return " ".join(get_text_body(msg).split())
+    return msg.as_string()
+
+
+# --- Filtering ----------------------------------------------------------
+def email_matches_filters(msg, filters, operator):
+    if not filters: return True
+    op = (operator or 'and').lower()
+
+    def one(f):
+        param = (f.get('param') or '').strip().lower()
+        ftype = (f.get('type') or 'contains').lower()
+        val = (f.get('value') or '').strip()
+        if not param or not val: return True
+        if param == 'body':
+            field = (get_html_body(msg) + ' ' + get_text_body(msg)).lower()
+        else:
+            field = decode_str(msg.get(param, '')).lower()
+        v = val.lower()
+        if ftype == 'contains':       return v in field
+        if ftype == 'equals':         return v == field
+        if ftype == 'starts_with':    return field.startswith(v)
+        if ftype == 'ends_with':      return field.endswith(v)
+        if ftype == 'not_contains':   return v not in field
+        if ftype == 'regex':
+            try: return re.search(val, field, re.IGNORECASE) is not None
+            except re.error: return False
+        return v in field
+
+    results = [one(f) for f in filters]
+    return all(results) if op == 'and' else any(results)
+
 
 def log(job_id, msg):
     JOBS[job_id]['log'].append(msg)
     print(f"[{job_id[:6]}] {msg}", flush=True)
 
-def strip_html_text(html):
-    soup = BeautifulSoup(html, 'html.parser')
-    for a in soup.find_all('a'): a.decompose()
-    return " ".join(soup.get_text(separator=' ').split())
 
-def strip_text_keep_html(html):
-    return " ".join(re.sub(r'>([^<]+)<', '><', html).split())
-
-def html_one_line(html):
-    return " ".join(html.split())
-
-def extract_html(parsed):
-    for part in parsed.walk():
-        if part.get_content_type() == "text/html":
-            try:
-                return part.get_payload(decode=True).decode(
-                    part.get_content_charset() or 'utf-8', errors='ignore')
-            except Exception:
-                return None
-    return None
-
-def process_content(html, mode):
-    if mode == 'text': return strip_html_text(html)
-    if mode == 'html_no_text': return strip_text_keep_html(html)
-    return html_one_line(html)
-
-def save_batch(job_dir, email_address, newsletters, batch_id):
-    if not newsletters: return None
+def save_batch(job_dir, email_address, items, batch_id, sep):
+    if not items: return None
     safe = re.sub(r'[^A-Za-z0-9_.@-]', '_', email_address)
     fname = os.path.join(job_dir, f"{safe}_batch_{batch_id}.txt")
+    sep = sep or '_SEPARATOR_'
     with open(fname, 'w', encoding='utf-8') as f:
-        for n in newsletters:
-            f.write(n + "\n\n")
+        f.write(f"\n{sep}\n".join(items) + "\n")
     return fname
 
 
@@ -302,72 +326,74 @@ def run_job(job_id, params, owner):
     try:
         JOBS[job_id]['status'] = 'running'
         creds = params['credentials']
-        mode = params.get('content_mode', 'html')
-        filter_type = params.get('filter_type', 'all')
+        provider = params.get('provider', 'others')
+        folder = params.get('folder', 'inbox')
+        return_type = params.get('return_type', 'fullsource')
+        sym_sep = params.get('symbol_separator', '')
+        result_sep = params.get('result_separator', '_SEPARATOR_')
+        max_emails = int(params.get('max_emails', 0) or 0)
+        order = params.get('order', 'new_to_old')
+        filters = params.get('filters', [])
+        filter_op = params.get('filter_operator', 'and')
         batch_size = int(params.get('batch_size', 10))
+
         job_dir = os.path.join(OUT_ROOT, job_id)
         os.makedirs(job_dir, exist_ok=True)
         JOBS[job_id]['dir'] = job_dir
 
         def worker(cred):
+            if JOBS[job_id].get('cancel'): return
             email_address, password = cred['email'], cred['password']
             try:
                 domain = email_address.split('@')[1]
-                imap_server = get_imap_server(domain)
+                imap_server = resolve_imap(domain, provider)
                 socket.setdefaulttimeout(30)
                 mail = imaplib.IMAP4_SSL(imap_server)
                 mail.login(email_address, password)
-                log(job_id, f"{email_address} logged in")
-                mail.select("inbox")
+                log(job_id, f"{email_address} logged in @ {imap_server}")
+                selected = select_folder(mail, folder)
+                log(job_id, f"{email_address} folder={selected}")
 
-                if filter_type == 'last_days':
-                    days = int(params.get('days', 30))
-                    since = (datetime.date.today() - datetime.timedelta(days=days)).strftime("%d-%b-%Y")
-                    status, messages = mail.search(None, f'SINCE {since}')
-                elif filter_type == 'from':
-                    sender = params.get('from_address', '').strip()
-                    status, messages = mail.search(None, f'FROM "{sender}"')
-                else:
-                    status, messages = mail.search(None, 'ALL')
-
-                if status != "OK":
-                    log(job_id, f"{email_address} search failed")
-                    mail.logout(); return
+                status, messages = mail.search(None, 'ALL')
+                if status != 'OK':
+                    log(job_id, f"{email_address} search failed"); mail.logout(); return
 
                 ids = messages[0].split()
                 total = len(ids)
-                log(job_id, f"{email_address}: {total} messages matched")
-                ids.reverse()
+                log(job_id, f"{email_address}: {total} messages in folder")
 
-                if filter_type == 'range':
-                    start = int(params.get('range_start', 1))
-                    end = int(params.get('range_end', total))
-                    start = max(1, start); end = min(total, end)
-                    ids = ids[start-1:end]
+                if order == 'new_to_old':
+                    ids.reverse()
+                if max_emails > 0:
+                    ids = ids[:max_emails]
 
-                newsletters = []
+                items = []
                 batch_id = 1
                 extracted = 0
+                kept = 0
                 for msg_id in ids:
+                    if JOBS[job_id].get('cancel'):
+                        log(job_id, f"{email_address} cancelled"); break
                     try:
-                        _, data = mail.fetch(msg_id, "(RFC822)")
+                        _, data = mail.fetch(msg_id, '(RFC822)')
                     except Exception as fe:
                         log(job_id, f"{email_address} fetch err: {fe}"); continue
                     for part in data:
                         if isinstance(part, tuple):
-                            parsed = email.message_from_bytes(part[1])
-                            html = extract_html(parsed)
-                            if html:
-                                newsletters.append(process_content(html, mode))
-                                extracted += 1
-                    if len(newsletters) >= batch_size:
-                        save_batch(job_dir, email_address, newsletters, batch_id)
-                        log(job_id, f"{email_address} saved batch {batch_id} ({len(newsletters)})")
-                        newsletters = []; batch_id += 1
-                if newsletters:
-                    save_batch(job_dir, email_address, newsletters, batch_id)
-                    log(job_id, f"{email_address} saved final batch ({len(newsletters)})")
-                log(job_id, f"{email_address} done: {extracted} newsletters")
+                            msg = email.message_from_bytes(part[1])
+                            extracted += 1
+                            if not email_matches_filters(msg, filters, filter_op):
+                                continue
+                            kept += 1
+                            items.append(render_email(msg, return_type, sym_sep))
+                    if len(items) >= batch_size:
+                        save_batch(job_dir, email_address, items, batch_id, result_sep)
+                        log(job_id, f"{email_address} saved batch {batch_id} ({len(items)})")
+                        items = []; batch_id += 1
+                if items:
+                    save_batch(job_dir, email_address, items, batch_id, result_sep)
+                    log(job_id, f"{email_address} saved final batch ({len(items)})")
+                log(job_id, f"{email_address} done: {extracted} scanned, {kept} kept")
                 mail.logout()
             except Exception as e:
                 log(job_id, f"ERROR {email_address}: {e}")
@@ -383,23 +409,26 @@ def run_job(job_id, params, owner):
                     full = os.path.join(root, fn)
                     zf.write(full, os.path.relpath(full, job_dir))
         JOBS[job_id]['zip'] = zip_path
-        JOBS[job_id]['status'] = 'done'
-        log(job_id, "JOB COMPLETE")
+        if JOBS[job_id].get('cancel'):
+            JOBS[job_id]['status'] = 'cancelled'
+            log(job_id, "JOB CANCELLED (partial results saved)")
+        else:
+            JOBS[job_id]['status'] = 'done'
+            log(job_id, "JOB COMPLETE")
     except Exception as e:
         JOBS[job_id]['status'] = 'error'
         log(job_id, f"FATAL: {e}")
 
 
 LOGIN_HTML = """<!doctype html><html><head><meta charset="utf-8"><title>Sign in</title>
-<style>body{margin:0;font-family:system-ui,sans-serif;background:#0f1115;color:#e6e9ef;
+<style>body{margin:0;font-family:system-ui,sans-serif;background:#f4f5f7;color:#1a1a1a;
 display:flex;align-items:center;justify-content:center;height:100vh}
-.box{background:#1a1d24;border:1px solid #2a2f3a;border-radius:8px;padding:24px;width:320px}
-h1{margin:0 0 16px;font-size:18px}label{display:block;font-size:12px;color:#8b93a7;margin:8px 0 4px}
-input{width:100%;font:inherit;color:#e6e9ef;background:#0c0e13;border:1px solid #2a2f3a;
-border-radius:6px;padding:8px 10px;box-sizing:border-box}
-button{width:100%;margin-top:14px;background:#6ea8fe;color:#0c0e13;border:0;
+.box{background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:24px;width:320px;box-shadow:0 1px 3px rgba(0,0,0,.06)}
+h1{margin:0 0 16px;font-size:18px}label{display:block;font-size:12px;color:#666;margin:8px 0 4px}
+input{width:100%;font:inherit;border:1px solid #d1d5db;border-radius:6px;padding:8px 10px;box-sizing:border-box}
+button{width:100%;margin-top:14px;background:#1ba9c2;color:#fff;border:0;
 border-radius:6px;padding:10px;font-weight:600;cursor:pointer}
-.err{color:#f85149;font-size:12px;margin-top:10px;min-height:16px}</style></head>
+.err{color:#d4183d;font-size:12px;margin-top:10px;min-height:16px}</style></head>
 <body><div class="box"><h1>🔒 Newsletter Extractor</h1>
 <form method="POST"><label>Username</label><input name="u" autofocus autocomplete="username">
 <label>Password</label><input name="p" type="password" autocomplete="current-password">
@@ -417,12 +446,10 @@ def login_page():
             u = request.form.get('u', '').strip()
             p = request.form.get('p', '')
             if _check(u, p):
-                session.permanent = True
-                session['user'] = u
+                session.permanent = True; session['user'] = u
                 _failed.pop(ip, None)
                 return redirect(url_for('index'))
-            _fail(ip)
-            err = 'Invalid credentials.'
+            _fail(ip); err = 'Invalid credentials.'
     return LOGIN_HTML.replace('__ERR__', err)
 
 
@@ -452,13 +479,25 @@ def start():
         return jsonify({'error': 'no credentials'}), 400
     job_id = uuid.uuid4().hex
     JOBS[job_id] = {'status': 'queued', 'log': [], 'dir': None, 'zip': None,
-                    'owner': session.get('user')}
+                    'owner': session.get('user'), 'cancel': False}
     threading.Thread(target=run_job, args=(job_id, params, session.get('user')), daemon=True).start()
     return jsonify({'job_id': job_id})
 
 
 def _owned(j):
     return j and j.get('owner') == session.get('user')
+
+
+@app.route('/stop/<job_id>', methods=['POST'])
+@require_auth
+def stop(job_id):
+    j = JOBS.get(job_id)
+    if not _owned(j): return jsonify({'error': 'unknown job'}), 404
+    if j['status'] in ('done', 'error', 'cancelled'):
+        return jsonify({'ok': True, 'status': j['status']})
+    j['cancel'] = True; j['status'] = 'cancelling'
+    log(job_id, "STOP requested by user")
+    return jsonify({'ok': True, 'status': 'cancelling'})
 
 
 @app.route('/status/<job_id>')
