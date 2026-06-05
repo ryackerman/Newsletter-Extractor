@@ -88,14 +88,175 @@ os.makedirs(OUT_ROOT, exist_ok=True)
 
 
 def get_imap_server(domain):
-    d = domain.lower()
-    if 'gmail.com' in d: return 'imap.gmail.com'
-    if 'yahoo' in d: return 'imap.mail.yahoo.com'
-    if any(x in d for x in ('outlook', 'hotmail', 'live')): return 'outlook.office365.com'
-    if 't-online.de' in d: return 'secureimap.t-online.de'
-    if 'aol' in d: return 'imap.aol.com'
-    if 'icloud' in d or 'me.com' in d: return 'imap.mail.me.com'
-    raise Exception(f"No IMAP server mapping for {domain}")
+    return resolve_imap(domain)
+
+
+# --- IMAP autodiscovery -------------------------------------------------
+# Strategy:
+#  1) Built-in table for known providers (incl. Japanese & big ISPs)
+#  2) Mozilla ISPDB (autoconfig)
+#  3) Thunderbird-style autoconfig DNS:  autoconfig.<domain>/mail/config-v1.1.xml
+#  4) DNS SRV record _imaps._tcp.<domain>
+#  5) Common-pattern probes: imap.<domain>, mail.<domain>, etc.
+
+import urllib.request, ssl as _ssl
+
+_IMAP_CACHE = {}
+
+KNOWN_IMAP = {
+    # Global
+    'gmail.com': 'imap.gmail.com',
+    'googlemail.com': 'imap.gmail.com',
+    'yahoo.com': 'imap.mail.yahoo.com',
+    'yahoo.co.jp': 'imap.mail.yahoo.co.jp',
+    'ymail.com': 'imap.mail.yahoo.com',
+    'rocketmail.com': 'imap.mail.yahoo.com',
+    'outlook.com': 'outlook.office365.com',
+    'hotmail.com': 'outlook.office365.com',
+    'live.com': 'outlook.office365.com',
+    'msn.com': 'outlook.office365.com',
+    'office365.com': 'outlook.office365.com',
+    'aol.com': 'imap.aol.com',
+    'icloud.com': 'imap.mail.me.com',
+    'me.com': 'imap.mail.me.com',
+    'mac.com': 'imap.mail.me.com',
+    'proton.me': '127.0.0.1',  # ProtonMail requires Bridge
+    'protonmail.com': '127.0.0.1',
+    'tutanota.com': None,  # no IMAP
+    'zoho.com': 'imap.zoho.com',
+    'zohomail.com': 'imap.zoho.com',
+    'gmx.com': 'imap.gmx.com',
+    'gmx.net': 'imap.gmx.net',
+    'gmx.de': 'imap.gmx.net',
+    'mail.com': 'imap.mail.com',
+    'fastmail.com': 'imap.fastmail.com',
+    'fastmail.fm': 'imap.fastmail.com',
+    'yandex.com': 'imap.yandex.com',
+    'yandex.ru': 'imap.yandex.ru',
+    'mail.ru': 'imap.mail.ru',
+    'inbox.ru': 'imap.mail.ru',
+    'list.ru': 'imap.mail.ru',
+    'bk.ru': 'imap.mail.ru',
+    # Japan
+    'ezweb.ne.jp': 'imap.au.com',
+    'au.com': 'imap.au.com',
+    'docomo.ne.jp': 'imap.spmode.ne.jp',
+    'spmode.ne.jp': 'imap.spmode.ne.jp',
+    'softbank.ne.jp': 'imap.softbank.jp',
+    'i.softbank.jp': 'imap.softbank.jp',
+    'nifty.com': 'imap.nifty.com',
+    'so-net.ne.jp': 'mail.so-net.ne.jp',
+    'biglobe.ne.jp': 'mail.biglobe.ne.jp',
+    'ocn.ne.jp': 'imap.ocn.ne.jp',
+    'plala.or.jp': 'imap.plala.or.jp',
+    'ybb.ne.jp': 'imap.ybb.ne.jp',
+    'excite.co.jp': 'mail.excite.co.jp',
+    # Germany / EU
+    't-online.de': 'secureimap.t-online.de',
+    'web.de': 'imap.web.de',
+    '1und1.de': 'imap.1und1.de',
+    'freenet.de': 'mx.freenet.de',
+    'mailbox.org': 'imap.mailbox.org',
+    'posteo.de': 'posteo.de',
+    'orange.fr': 'imap.orange.fr',
+    'wanadoo.fr': 'imap.orange.fr',
+    'free.fr': 'imap.free.fr',
+    'laposte.net': 'imap.laposte.net',
+    'libero.it': 'imapmail.libero.it',
+    'tiscali.it': 'imap.tiscali.it',
+    # UK / other
+    'btinternet.com': 'mail.btinternet.com',
+    'sky.com': 'imap.tools.sky.com',
+    'virginmedia.com': 'imap.virginmedia.com',
+    # US ISPs
+    'comcast.net': 'imap.comcast.net',
+    'verizon.net': 'imap.aol.com',
+    'att.net': 'imap.mail.att.net',
+    'sbcglobal.net': 'imap.mail.att.net',
+    'cox.net': 'imap.cox.net',
+    'charter.net': 'mobile.charter.net',
+    'optonline.net': 'mail.optonline.net',
+    'earthlink.net': 'imap.earthlink.net',
+    # India / others
+    'rediffmail.com': 'imap.rediffmail.com',
+    'sina.com': 'imap.sina.com',
+    'qq.com': 'imap.qq.com',
+    '163.com': 'imap.163.com',
+    '126.com': 'imap.126.com',
+}
+
+def _probe_imap(host, port=993, timeout=4):
+    try:
+        ctx = _ssl.create_default_context()
+        with socket.create_connection((host, port), timeout=timeout) as s:
+            with ctx.wrap_socket(s, server_hostname=host) as ss:
+                banner = ss.recv(64)
+                return b'IMAP' in banner.upper() or b'OK' in banner.upper()
+    except Exception:
+        return False
+
+def _try_ispdb(domain):
+    urls = [
+        f"https://autoconfig.thunderbird.net/v1.1/{domain}",
+        f"https://autoconfig.{domain}/mail/config-v1.1.xml?emailaddress=user@{domain}",
+        f"http://autoconfig.{domain}/mail/config-v1.1.xml?emailaddress=user@{domain}",
+    ]
+    for url in urls:
+        try:
+            with urllib.request.urlopen(url, timeout=5) as r:
+                xml = r.read().decode('utf-8', errors='ignore')
+            m = re.search(
+                r'<incomingServer[^>]*type=["\']imap["\'][^>]*>(.*?)</incomingServer>',
+                xml, re.DOTALL | re.IGNORECASE)
+            if m:
+                h = re.search(r'<hostname>([^<]+)</hostname>', m.group(1))
+                if h:
+                    host = h.group(1).strip().replace('%EMAILDOMAIN%', domain)
+                    return host
+        except Exception:
+            continue
+    return None
+
+def _try_dns_srv(domain):
+    try:
+        import dns.resolver  # optional
+        answers = dns.resolver.resolve(f'_imaps._tcp.{domain}', 'SRV', lifetime=4)
+        recs = sorted(answers, key=lambda r: (r.priority, -r.weight))
+        for r in recs:
+            host = str(r.target).rstrip('.')
+            if host and host != '.': return host
+    except Exception:
+        pass
+    return None
+
+def _try_patterns(domain):
+    for h in (f'imap.{domain}', f'mail.{domain}', f'imaps.{domain}', f'imap-mail.{domain}', domain):
+        if _probe_imap(h):
+            return h
+    return None
+
+def resolve_imap(domain):
+    domain = domain.lower().strip()
+    if domain in _IMAP_CACHE: return _IMAP_CACHE[domain]
+
+    if domain in KNOWN_IMAP:
+        host = KNOWN_IMAP[domain]
+        if host is None:
+            raise Exception(f"{domain} does not support IMAP")
+        _IMAP_CACHE[domain] = host
+        return host
+
+    for fn in (_try_ispdb, _try_dns_srv, _try_patterns):
+        try:
+            host = fn(domain)
+            if host:
+                _IMAP_CACHE[domain] = host
+                return host
+        except Exception:
+            continue
+
+    raise Exception(f"Could not autodiscover IMAP for {domain}. Add it manually to KNOWN_IMAP.")
+# ------------------------------------------------------------------------
 
 def log(job_id, msg):
     JOBS[job_id]['log'].append(msg)
