@@ -37,6 +37,59 @@ def _load_users():
     return {os.environ.get('APP_USER', 'admin'): os.environ.get('APP_PASS', 'changeme')}
 
 USERS = _load_users()
+ADMINS = set(u.strip() for u in os.environ.get('APP_ADMINS', '').split(',') if u.strip())
+if not ADMINS:
+    # First user in APP_USERS (or 'admin') is admin by default
+    ADMINS = {next(iter(USERS))} if USERS else set()
+
+# --- AUDIT LOG ----------------------------------------------------------
+AUDIT_FILE = os.path.join('/tmp' if os.environ.get('RENDER') else HERE, 'audit.log') if False else None
+_AUDIT_FILE = os.path.join('/tmp' if os.environ.get('RENDER') else os.path.dirname(os.path.abspath(__file__)), 'audit.log')
+_AUDIT_LOCK = threading.Lock()
+_AUDIT_MAX = 5000  # keep last N entries in memory
+
+AUDIT = []  # list of {ts, user, ip, event, details}
+
+def audit(event, user=None, details=None):
+    entry = {
+        'ts': datetime.datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+        'user': user or (session.get('user') if request else None) or '-',
+        'ip': _client_ip() if request else '-',
+        'event': event,
+        'details': details or '',
+    }
+    with _AUDIT_LOCK:
+        AUDIT.append(entry)
+        if len(AUDIT) > _AUDIT_MAX:
+            del AUDIT[:len(AUDIT) - _AUDIT_MAX]
+        try:
+            with open(_AUDIT_FILE, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+        except Exception:
+            pass
+    print(f"AUDIT {entry['ts']} {entry['user']}@{entry['ip']} {event}: {entry['details']}", flush=True)
+
+def _load_audit_from_disk():
+    if not os.path.exists(_AUDIT_FILE): return
+    try:
+        with open(_AUDIT_FILE, 'r', encoding='utf-8') as f:
+            for line in f.readlines()[-_AUDIT_MAX:]:
+                try: AUDIT.append(json.loads(line))
+                except Exception: pass
+    except Exception:
+        pass
+
+_load_audit_from_disk()
+
+def require_admin(f):
+    @wraps(f)
+    def wrap(*a, **kw):
+        if session.get('user') not in ADMINS:
+            return jsonify({'error': 'forbidden'}), 403
+        return f(*a, **kw)
+    return wrap
+# ------------------------------------------------------------------------
+
 MAX_ATTEMPTS = 5
 LOCKOUT_SECS = 300
 _failed = {}
@@ -442,12 +495,17 @@ def run_job(job_id, params, owner):
         if JOBS[job_id].get('cancel'):
             JOBS[job_id]['status'] = 'cancelled'
             log(job_id, "JOB CANCELLED (partial results saved)")
+            audit('job_cancelled', user=owner,
+                  details=f"job={job_id[:8]} files={len(JOBS[job_id]['files'])}")
         else:
             JOBS[job_id]['status'] = 'done'
             log(job_id, "JOB COMPLETE")
+            audit('job_done', user=owner,
+                  details=f"job={job_id[:8]} files={len(JOBS[job_id]['files'])}")
     except Exception as e:
         JOBS[job_id]['status'] = 'error'
         log(job_id, f"FATAL: {e}")
+        audit('job_error', user=owner, details=f"job={job_id[:8]} err={e}")
 
 
 LOGIN_HTML = """<!doctype html><html><head><meta charset="utf-8"><title>Sign in</title>
@@ -472,19 +530,24 @@ def login_page():
         ip = _client_ip()
         if _locked(ip):
             err = 'Too many failed attempts. Try again later.'
+            audit('login_locked', user=request.form.get('u','-'))
         else:
             u = request.form.get('u', '').strip()
             p = request.form.get('p', '')
             if _check(u, p):
                 session.permanent = True; session['user'] = u
                 _failed.pop(ip, None)
+                audit('login_success', user=u)
                 return redirect(url_for('index'))
             _fail(ip); err = 'Invalid credentials.'
+            audit('login_fail', user=u or '-')
     return LOGIN_HTML.replace('__ERR__', err)
 
 
 @app.route('/logout')
 def logout():
+    if session.get('user'):
+        audit('logout', user=session.get('user'))
     session.clear()
     return redirect(url_for('login_page'))
 
@@ -510,6 +573,15 @@ def start():
     job_id = uuid.uuid4().hex
     JOBS[job_id] = {'status': 'queued', 'log': [], 'dir': None, 'zip': None,
                     'owner': session.get('user'), 'cancel': False, 'files': []}
+    mailboxes = [c.get('email','?') for c in params['credentials']]
+    audit('job_start', details=(
+        f"job={job_id[:8]} "
+        f"provider={params.get('provider','?')} "
+        f"folder={params.get('folder','?')} "
+        f"type={params.get('return_type','?')} "
+        f"max={params.get('max_emails','?')} "
+        f"mailboxes={','.join(mailboxes)}"
+    ))
     threading.Thread(target=run_job, args=(job_id, params, session.get('user')), daemon=True).start()
     return jsonify({'job_id': job_id})
 
@@ -527,6 +599,7 @@ def stop(job_id):
         return jsonify({'ok': True, 'status': j['status']})
     j['cancel'] = True; j['status'] = 'cancelling'
     log(job_id, "STOP requested by user")
+    audit('job_stop', details=f"job={job_id[:8]}")
     return jsonify({'ok': True, 'status': 'cancelling'})
 
 
@@ -565,6 +638,110 @@ def download(job_id):
 @app.route('/healthz')
 def healthz():
     return 'ok'
+
+
+# --- ADMIN AUDIT --------------------------------------------------------
+ADMIN_HTML = """<!doctype html><html><head><meta charset="utf-8"><title>Audit Log</title>
+<style>body{margin:0;font-family:-apple-system,system-ui,sans-serif;background:#f4f5f7;color:#1f2937;padding:20px}
+h1{margin:0 0 16px;font-size:20px;display:flex;justify-content:space-between;align-items:center}
+.head a{font-size:12px;color:#6b7280;text-decoration:none;border:1px solid #e5e7eb;padding:6px 10px;border-radius:6px;background:#fff;margin-left:8px}
+.bar{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap}
+input,select,button{font:inherit;border:1px solid #e5e7eb;border-radius:6px;padding:6px 10px;background:#fff}
+button{cursor:pointer;background:#1ba9c2;color:#fff;border:0;font-weight:600}
+button.sec{background:#fff;color:#1f2937;border:1px solid #e5e7eb}
+.card{background:#fff;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th,td{padding:8px 10px;text-align:left;border-bottom:1px solid #f3f4f6;vertical-align:top}
+th{background:#fafafa;font-weight:600;position:sticky;top:0}
+tr:hover td{background:#f9fafb}
+.ev{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:600;background:#e5e7eb;color:#374151}
+.ev.login_success{background:#dcfce7;color:#166534}
+.ev.login_fail{background:#fee2e2;color:#991b1b}
+.ev.login_locked{background:#fef3c7;color:#92400e}
+.ev.job_start{background:#dbeafe;color:#1d4ed8}
+.ev.job_done{background:#dcfce7;color:#166534}
+.ev.job_stop,.ev.job_cancelled{background:#fef3c7;color:#92400e}
+.ev.job_error{background:#fee2e2;color:#991b1b}
+.det{font-family:ui-monospace,monospace;font-size:11px;color:#6b7280;word-break:break-all;max-width:600px}
+.muted{color:#9ca3af;font-size:11px}
+</style></head><body>
+<h1>🛡️ Audit Log <span><a href="/">← App</a><a href="/logout">Sign out</a></span></h1>
+<div class="bar">
+  <input id="q" placeholder="filter (user / event / details)" style="flex:1;min-width:200px">
+  <select id="evf"><option value="">All events</option></select>
+  <button class="sec" id="refresh">↻ Refresh</button>
+  <a href="/admin/export" download style="text-decoration:none"><button class="sec">⬇ Export .jsonl</button></a>
+</div>
+<div class="card"><table><thead>
+<tr><th>Time (UTC)</th><th>User</th><th>IP</th><th>Event</th><th>Details</th></tr>
+</thead><tbody id="rows"></tbody></table></div>
+<div class="muted" id="count" style="margin-top:8px"></div>
+<script>
+let data = [];
+async function load(){
+  const r = await fetch('/admin/data');
+  if(r.status===403){ document.body.innerHTML='<h1>403 Forbidden</h1>'; return; }
+  data = await r.json();
+  // populate event filter
+  const evs = [...new Set(data.map(d=>d.event))].sort();
+  const sel = document.getElementById('evf');
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">All events</option>' + evs.map(e=>`<option ${e===cur?'selected':''}>${e}</option>`).join('');
+  render();
+}
+function render(){
+  const q = document.getElementById('q').value.toLowerCase();
+  const ev = document.getElementById('evf').value;
+  const rows = data.filter(d => {
+    if(ev && d.event!==ev) return false;
+    if(!q) return true;
+    return (d.user+' '+d.event+' '+d.details+' '+d.ip).toLowerCase().includes(q);
+  }).slice().reverse();
+  document.getElementById('rows').innerHTML = rows.map(d=>`
+    <tr><td>${d.ts}</td><td><b>${d.user}</b></td><td>${d.ip}</td>
+    <td><span class="ev ${d.event}">${d.event}</span></td>
+    <td class="det">${(d.details||'').replace(/[<>]/g,'')}</td></tr>`).join('');
+  document.getElementById('count').textContent = `${rows.length} of ${data.length} entries`;
+}
+document.getElementById('q').addEventListener('input', render);
+document.getElementById('evf').addEventListener('change', render);
+document.getElementById('refresh').addEventListener('click', load);
+load();
+setInterval(load, 10000);
+</script></body></html>"""
+
+
+@app.route('/admin')
+@require_auth
+@require_admin
+def admin_page():
+    return ADMIN_HTML
+
+
+@app.route('/admin/data')
+@require_auth
+@require_admin
+def admin_data():
+    with _AUDIT_LOCK:
+        return jsonify(list(AUDIT))
+
+
+@app.route('/admin/export')
+@require_auth
+@require_admin
+def admin_export():
+    with _AUDIT_LOCK:
+        body = '\n'.join(json.dumps(e, ensure_ascii=False) for e in AUDIT)
+    from flask import Response
+    return Response(body, mimetype='application/x-ndjson',
+                    headers={'Content-Disposition': 'attachment; filename=audit.jsonl'})
+
+
+@app.route('/whoami')
+@require_auth
+def whoami():
+    return jsonify({'user': session.get('user'), 'is_admin': session.get('user') in ADMINS})
+# ------------------------------------------------------------------------
 
 
 if __name__ == '__main__':
