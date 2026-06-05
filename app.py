@@ -1,9 +1,7 @@
 """
-Newsletter Extractor - Flask backend (Render-ready)
-Local:  pip install -r requirements.txt && python app.py
-Render: gunicorn app:app
+Newsletter Extractor - Flask backend (Render-ready, multi-user)
 """
-import os, re, imaplib, email, socket, datetime, threading, uuid, secrets, hmac, time
+import os, re, imaplib, email, socket, datetime, threading, uuid, secrets, hmac, time, json
 from functools import wraps
 from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
@@ -16,12 +14,34 @@ app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE='Lax',
     SESSION_COOKIE_SECURE=bool(os.environ.get('RENDER')),
-    PERMANENT_SESSION_LIFETIME=3600,
+    PERMANENT_SESSION_LIFETIME=86400,  # 24h
 )
 
-# --- AUTH ---------------------------------------------------------------
-AUTH_USER = os.environ.get('APP_USER', 'admin')
-AUTH_PASS = os.environ.get('APP_PASS', 'changeme')
+# --- USERS --------------------------------------------------------------
+# Source priority:
+#   1) APP_USERS env var: JSON  {"alice":"pw1","bob":"pw2"}
+#   2) APP_USERS env var: CSV   "alice:pw1,bob:pw2"
+#   3) Legacy APP_USER/APP_PASS (single user)
+#   4) Default admin:changeme
+
+def _load_users():
+    raw = os.environ.get('APP_USERS', '').strip()
+    if raw:
+        try:
+            d = json.loads(raw)
+            if isinstance(d, dict): return {str(k): str(v) for k, v in d.items()}
+        except Exception:
+            pass
+        # CSV fallback
+        out = {}
+        for pair in raw.split(','):
+            if ':' in pair:
+                u, p = pair.split(':', 1)
+                out[u.strip()] = p.strip()
+        if out: return out
+    return {os.environ.get('APP_USER', 'admin'): os.environ.get('APP_PASS', 'changeme')}
+
+USERS = _load_users()
 MAX_ATTEMPTS = 5
 LOCKOUT_SECS = 300
 _failed = {}
@@ -43,10 +63,17 @@ def _fail(ip):
     if rec[0] == 1: rec[1] = time.time()
     _failed[ip] = rec
 
+def _check(u, p):
+    expected = USERS.get(u)
+    if expected is None:
+        # constant-time dummy compare to avoid user-enum timing
+        hmac.compare_digest('x', 'y'); return False
+    return hmac.compare_digest(p, expected)
+
 def require_auth(f):
     @wraps(f)
     def wrap(*a, **kw):
-        if not session.get('auth'):
+        if not session.get('user'):
             if request.path.startswith(('/start', '/status', '/download')) or request.is_json:
                 return jsonify({'error': 'unauthorized'}), 401
             return redirect(url_for('login_page'))
@@ -70,11 +97,9 @@ def get_imap_server(domain):
     if 'icloud' in d or 'me.com' in d: return 'imap.mail.me.com'
     raise Exception(f"No IMAP server mapping for {domain}")
 
-
 def log(job_id, msg):
     JOBS[job_id]['log'].append(msg)
     print(f"[{job_id[:6]}] {msg}", flush=True)
-
 
 def strip_html_text(html):
     soup = BeautifulSoup(html, 'html.parser')
@@ -112,7 +137,7 @@ def save_batch(job_dir, email_address, newsletters, batch_id):
     return fname
 
 
-def run_job(job_id, params):
+def run_job(job_id, params, owner):
     try:
         JOBS[job_id]['status'] = 'running'
         creds = params['credentials']
@@ -228,11 +253,11 @@ def login_page():
         if _locked(ip):
             err = 'Too many failed attempts. Try again later.'
         else:
-            u = request.form.get('u', '')
+            u = request.form.get('u', '').strip()
             p = request.form.get('p', '')
-            if hmac.compare_digest(u, AUTH_USER) and hmac.compare_digest(p, AUTH_PASS):
+            if _check(u, p):
                 session.permanent = True
-                session['auth'] = True
+                session['user'] = u
                 _failed.pop(ip, None)
                 return redirect(url_for('index'))
             _fail(ip)
@@ -244,6 +269,12 @@ def login_page():
 def logout():
     session.clear()
     return redirect(url_for('login_page'))
+
+
+@app.route('/me')
+@require_auth
+def me():
+    return jsonify({'user': session.get('user')})
 
 
 @app.route('/')
@@ -259,16 +290,21 @@ def start():
     if not params.get('credentials'):
         return jsonify({'error': 'no credentials'}), 400
     job_id = uuid.uuid4().hex
-    JOBS[job_id] = {'status': 'queued', 'log': [], 'dir': None, 'zip': None}
-    threading.Thread(target=run_job, args=(job_id, params), daemon=True).start()
+    JOBS[job_id] = {'status': 'queued', 'log': [], 'dir': None, 'zip': None,
+                    'owner': session.get('user')}
+    threading.Thread(target=run_job, args=(job_id, params, session.get('user')), daemon=True).start()
     return jsonify({'job_id': job_id})
+
+
+def _owned(j):
+    return j and j.get('owner') == session.get('user')
 
 
 @app.route('/status/<job_id>')
 @require_auth
 def status(job_id):
     j = JOBS.get(job_id)
-    if not j: return jsonify({'error': 'unknown job'}), 404
+    if not _owned(j): return jsonify({'error': 'unknown job'}), 404
     return jsonify({'status': j['status'], 'log': j['log'][-200:],
                     'has_zip': bool(j.get('zip'))})
 
@@ -277,7 +313,7 @@ def status(job_id):
 @require_auth
 def download(job_id):
     j = JOBS.get(job_id)
-    if not j or not j.get('zip'): return 'not ready', 404
+    if not _owned(j) or not j.get('zip'): return 'not ready', 404
     return send_file(j['zip'], as_attachment=True,
                      download_name=f'newsletters_{job_id[:8]}.zip')
 
@@ -289,7 +325,8 @@ def healthz():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    if AUTH_PASS == 'changeme':
-        print("⚠  Default password in use. Set APP_USER / APP_PASS env vars.")
-    print(f"Open http://localhost:{port}  (user: {AUTH_USER})")
+    if 'changeme' in USERS.values():
+        print("⚠  Default password 'changeme' is in use. Set APP_USERS env var.")
+    print(f"Users: {list(USERS.keys())}")
+    print(f"Open http://localhost:{port}")
     app.run(host='0.0.0.0', port=port, debug=False)
