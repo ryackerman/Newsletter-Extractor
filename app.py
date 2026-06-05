@@ -93,12 +93,10 @@ def audit(event, user=None, details=None):
     print(f"AUDIT {entry['ts']} {entry['user']}@{entry['ip']} {event}: {entry['details']}", flush=True)
 
 def _load_audit_from_disk():
-    if not os.path.exists(_AUDIT_FILE): return
+    # Audit log is cleared on every app startup (deploy/restart wipes it)
     try:
-        with open(_AUDIT_FILE, 'r', encoding='utf-8') as f:
-            for line in f.readlines()[-_AUDIT_MAX:]:
-                try: AUDIT.append(json.loads(line))
-                except Exception: pass
+        if os.path.exists(_AUDIT_FILE):
+            os.remove(_AUDIT_FILE)
     except Exception:
         pass
 
@@ -460,22 +458,24 @@ def log(job_id, msg):
     print(f"[{job_id[:6]}] {msg}", flush=True)
 
 
-def save_mailbox(job_id, job_dir, email_address, items, sep):
+def save_mailbox(job_id, job_dir, email_address, items, sep, folder_label='inbox'):
     """Save all newsletters for one mailbox to a single .txt with separator between."""
     if not items: return None
     safe_addr = re.sub(r'[^A-Za-z0-9_.@-]', '_', email_address)
-    fname = f"{safe_addr}.txt"
+    safe_folder = re.sub(r'[^A-Za-z0-9_-]', '_', folder_label).strip('_') or 'inbox'
+    date_str = datetime.date.today().strftime('%Y-%m-%d')
+    fname = f"{safe_addr}-{safe_folder}-{date_str}.txt"
     full = os.path.join(job_dir, fname)
     sep = sep or '_SEPARATOR_'
     body = f"\n{sep}\n".join(items)
     with open(full, 'w', encoding='utf-8') as f:
         f.write(body + "\n")
     size = len(body.encode('utf-8'))
-    # Replace existing entry if re-saved
     JOBS[job_id]['files'] = [f for f in JOBS[job_id]['files'] if f['name'] != fname]
     JOBS[job_id]['files'].append({
         'name': fname,
         'email': email_address,
+        'folder': folder_label,
         'count': len(items),
         'size': size,
     })
@@ -569,10 +569,10 @@ def run_job(job_id, params, owner):
                             kept += 1
                             items.append(render_email(msg, return_type, sym_sep))
                     if kept and kept % FLUSH_EVERY == 0:
-                        save_mailbox(job_id, job_dir, email_address, items, result_sep)
+                        save_mailbox(job_id, job_dir, email_address, items, result_sep, folder)
                 # Final save
                 if items:
-                    save_mailbox(job_id, job_dir, email_address, items, result_sep)
+                    save_mailbox(job_id, job_dir, email_address, items, result_sep, folder)
                 dur = round(time.time() - mb_start, 1)
                 log(job_id, f"{email_address} done: {extracted} scanned, {kept} saved")
                 audit_bg('mailbox_done', owner, details=(
