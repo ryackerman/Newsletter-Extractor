@@ -328,29 +328,24 @@ def log(job_id, msg):
     print(f"[{job_id[:6]}] {msg}", flush=True)
 
 
-def save_single(job_id, job_dir, email_address, msg, content, idx):
-    """Save one email as its own .txt file. Returns filename."""
+def save_mailbox(job_id, job_dir, email_address, items, sep):
+    """Save all newsletters for one mailbox to a single .txt with separator between."""
+    if not items: return None
     safe_addr = re.sub(r'[^A-Za-z0-9_.@-]', '_', email_address)
-    subj = decode_str(msg.get('Subject', '')) or 'no-subject'
-    subj = re.sub(r'[^A-Za-z0-9 _.-]', '_', subj)[:80].strip().replace(' ', '_') or 'msg'
-    date_raw = msg.get('Date', '')
-    try:
-        dt = email.utils.parsedate_to_datetime(date_raw)
-        ts = dt.strftime('%Y%m%d_%H%M%S') if dt else ''
-    except Exception:
-        ts = ''
-    parts = [safe_addr, ts, f"{idx:05d}", subj]
-    fname = '__'.join(p for p in parts if p) + '.txt'
+    fname = f"{safe_addr}.txt"
     full = os.path.join(job_dir, fname)
+    sep = sep or '_SEPARATOR_'
+    body = f"\n{sep}\n".join(items)
     with open(full, 'w', encoding='utf-8') as f:
-        f.write(content)
+        f.write(body + "\n")
+    size = len(body.encode('utf-8'))
+    # Replace existing entry if re-saved
+    JOBS[job_id]['files'] = [f for f in JOBS[job_id]['files'] if f['name'] != fname]
     JOBS[job_id]['files'].append({
         'name': fname,
         'email': email_address,
-        'subject': decode_str(msg.get('Subject', '')) or '(no subject)',
-        'from': decode_str(msg.get('From', '')),
-        'date': date_raw,
-        'size': len(content.encode('utf-8')),
+        'count': len(items),
+        'size': size,
     })
     return fname
 
@@ -368,11 +363,13 @@ def run_job(job_id, params, owner):
         order = params.get('order', 'new_to_old')
         filters = params.get('filters', [])
         filter_op = params.get('filter_operator', 'and')
-        batch_size = int(params.get('batch_size', 10))
 
         job_dir = os.path.join(OUT_ROOT, job_id)
         os.makedirs(job_dir, exist_ok=True)
         JOBS[job_id]['dir'] = job_dir
+
+        # how often to flush partial progress to disk
+        FLUSH_EVERY = 5
 
         def worker(cred):
             if JOBS[job_id].get('cancel'): return
@@ -400,7 +397,7 @@ def run_job(job_id, params, owner):
                 if max_emails > 0:
                     ids = ids[:max_emails]
 
-                items_count = 0
+                items = []
                 extracted = 0
                 kept = 0
                 for msg_id in ids:
@@ -417,9 +414,12 @@ def run_job(job_id, params, owner):
                             if not email_matches_filters(msg, filters, filter_op):
                                 continue
                             kept += 1
-                            content = render_email(msg, return_type, sym_sep)
-                            save_single(job_id, job_dir, email_address, msg, content, kept)
-                            items_count += 1
+                            items.append(render_email(msg, return_type, sym_sep))
+                    if kept and kept % FLUSH_EVERY == 0:
+                        save_mailbox(job_id, job_dir, email_address, items, result_sep)
+                # Final save
+                if items:
+                    save_mailbox(job_id, job_dir, email_address, items, result_sep)
                 log(job_id, f"{email_address} done: {extracted} scanned, {kept} saved")
                 mail.logout()
             except Exception as e:
